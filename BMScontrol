@@ -1,0 +1,990 @@
+/**
+Due to signed NDA's I cannot upload rest of the files, but here is an overview of the code to control the BMS
+ */
+
+#include "bmsControl.h"
+#include <stdint.h>
+#include "shellprintf.h"
+#include "Cpu/Std/Platform_Types.h"
+#include "math.h"
+#include <SafeRTOS/kernel/portable/013_Tasking/032_Aurix/SafeRTOS_API.h>
+
+#include "psoc.h"
+#include "tle9012.h"
+#include "tle9012_reg.h"
+#include "ecu8Control.h"
+
+/**
+ * \brief Data Structures used for Cell and Pack information
+ */
+__private0 BATTERY_INFO_t packInfo;						/**< \brief Battery Pack information*/
+__private0 CELL_INFO_t cellInfo;						/**< \brief Cell information*/
+__private0 BMS_CONTROL_t bmsControl;						/**< \brief Flags which control operation of the BMS system*/
+
+
+
+
+/**
+ * ******************************
+ * \name Private Functions
+ *******************************
+ *\{*/
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_TLE9012_Initialization()\n
+ * 			This function performs the following functions\n
+ * 			1.) Enumerates the 9012\n
+ *
+ * @retval	True on success
+ * @retval  False on failure
+ *****************************************************************************/
+static boolean bmsControl_TLE9012_Initialization(void)
+{
+	xTaskDelay(100);
+	uint8_t errormsg;
+	boolean retVal = TRUE;
+	/*
+	 * 1. Enumerate
+	 * 2. Initialize Config registers
+	 * 2. Config Thresholds
+	 * 3. Flag Initialization done
+	 */
+
+	//1. Enumerate
+	tle9012Info.ntwkConfig = TLE9012_NTWK_CONFIG;
+	tle9012Info.wdgEnable = TLE9012_KEEP_ALIVE;
+	tle9012Info.numExtThermistors = TLE9012_NUMBER_EXT_THERM;
+	tle9012Info.balancingEnabled = BALANCING_ON;
+	tle9012Info.numNodesDetected = tle9012_enumerateNetwork(TLE9012_NTWK_CONFIG, TLE9012_ENABLE_ADCS, 0, TLE9012_KEEP_ALIVE, bmsControl.nodesInSystem, &errormsg);
+
+	if (tle9012Info.numNodesDetected == bmsControl.nodesInSystem)
+	{
+		tle9012Info.isNumerated = true;
+	}
+	else
+	{
+		tle9012Info.isNumerated = false;
+		retVal = false;
+	}
+
+	return retVal;
+}
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_getBatteryMetrics()\n
+ * 		This function retrieves the Battery Pack metrics from the Fuel Gauge and stores it
+ * 		into the packInfo structure\n
+ * 		It will also set or clear the charge / discharge flags in BMS_FLAGS_t
+ *
+ * @retval	None.
+ *****************************************************************************/
+static void bmsControl_getBatteryMetrics(void)
+{
+	TLE9012_GPIO_Register_t	configGPIO;
+	uint8_t errormsg;
+
+
+
+
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		switch (bmsControl.flowControl.fuelGauge_Control)
+		{
+			case FUEL_GAUGE_NONE:
+			{
+				break;
+			}
+			case FUEL_GAUGE_PSOC:
+			{
+				if (true == tle9012Info.isInitialized)
+				{
+					if (TRUE == flagRecvdPsocCurrent)
+					{
+						packInfo.packCurrent = psoc_Current;
+						packInfo.packVoltage = cellInfo.batV[0];
+						flagRecvdPsocCurrent = FALSE;
+					}
+				}
+
+				break;
+			}
+			default:
+			{
+				break;
+			}
+		}
+
+		configGPIO.U16 = tle9012Info.registers[0].GPIO_Reg.U16;
+
+		if (packInfo.packCurrent > ICHARGE_MIN)
+		{
+			if(bmsControl.charging == 0)
+			{
+				configGPIO.B.PWM_PWM0 = 1;
+				configGPIO.B.PWM_PWM1 = 0;
+				tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO,configGPIO.U16,&errormsg);
+
+			}
+			bmsControl.charging = 1;
+			bmsControl.discharging = 0;
+
+		}
+		else if(packInfo.packCurrent < IDISCHARGE_MIN)
+		{
+			if(bmsControl.discharging == 0)
+			{
+				configGPIO.B.PWM_PWM0 = 0;
+				configGPIO.B.PWM_PWM1 = 1;
+
+
+				tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO,configGPIO.U16,&errormsg);
+			}
+			bmsControl.discharging = 1;
+			bmsControl.charging = 0;
+
+		}
+		else
+		{
+			if(bmsControl.charging == 1 || bmsControl.discharging ==1)
+			{
+				configGPIO.B.PWM_PWM0 = 0;
+				configGPIO.B.PWM_PWM1 = 0;
+
+				tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO,configGPIO.U16,&errormsg);
+			}
+			bmsControl.charging = 0;
+			bmsControl.discharging = 0;
+		}
+	}
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_getCellMetrics()\n
+ * 		This function retrieves the Cell metrics from the TLE9012 and stores it
+ * 		into the cellInfo structure -> CELL_INFO_t
+ *
+ *
+ * @retval	None.
+ *****************************************************************************/
+static void bmsControl_getCellMetrics(void)
+{
+
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		uint8_t errormsg;
+		uint8_t readresult[10];
+
+		if (tle9012Info.isInitialized)
+		{
+			cellInfo.gettingMeasurement = 1;
+			//trigger measurement
+			tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_MEAS_CTRL, TLE9012_TRIG_MEAS, &errormsg );
+
+			xTaskDelay(50);
+
+			for (uint8_t i=0;i< tle9012Info.numNodesDetected;i++)
+			{
+				tle9012Info.registers[i].MEAS_CTRL_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_MEAS_CTRL, readresult);
+				while ((tle9012Info.registers[i].MEAS_CTRL_Reg.U16 & 0x8840) != 0x0000 ) // Is a measurement in process
+				{
+					delayMillseconds(1);
+					tle9012Info.registers[i].MEAS_CTRL_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_MEAS_CTRL, readresult);
+				}
+				//Pack Voltage
+				tle9012Info.registers[i].BVM_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_BVM, readresult);
+				cellInfo.batV[i] = tle9012Info.registers[i].BVM_Reg.U16 *60000/65536;
+
+                tle9012Info.registers[i].GPIO_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i + 1, TLE9012_REG_GPIO, readresult);
+
+                // Write updated GPIO state
+                tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO, tle9012Info.registers[i].GPIO_Reg.U16, &errormsg);
+
+
+				//Highest Cell Voltage
+				tle9012Info.registers[i].SCVM_HIGH_reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_SCVM_HIGH, readresult);
+				cellInfo.highestCell[i] = (float)(tle9012Info.registers[i].SCVM_HIGH_reg.B.RESULT)*5000/2048;
+
+				//Lowest Cell Voltage
+				tle9012Info.registers[i].SCVM_LOW_reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_SCVM_LOW, readresult);
+				cellInfo.lowestCell[i] = (float)(tle9012Info.registers[i].SCVM_LOW_reg.B.RESULT )*5000/2048;
+
+				//Internal temperature
+				tle9012Info.registers[i].INT_TEMP_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_INT_TEMP, readresult);
+				cellInfo.intTemp[i] = 5473 - (uint16_t)((uint32_t)(tle9012Info.registers[i].INT_TEMP_Reg.B.RESULT* 6624)/1000);
+
+				//External temperatures
+				for (uint8_t therm = 0; therm < TLE9012_NUMBER_EXT_THERM; therm++)
+				{
+					tle9012Info.registers[i].EXT_TEMP_Reg[therm].U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_EXT_TEMP_0+therm, readresult);
+					if (TEMP_IS_VALID == tle9012Info.registers[i].EXT_TEMP_Reg[therm].B.VALID)
+					{
+	//					cellInfo.extTemp[i][therm] = (tle9012Info.registers[i].EXT_TEMP_Reg[therm].B.RESULT) * pow(4,tle9012Info.registers[i].EXT_TEMP_Reg[therm].B.INTC) * TLE9012_EXT_OT_CONV;
+						cellInfo.extTemp[i][therm] = (uint16_t)((tle9012Info.registers[i].EXT_TEMP_Reg[therm].B.RESULT) * pow(4,tle9012Info.registers[i].EXT_TEMP_Reg[therm].B.INTC)*2)/(1024*.000320)-100;
+					}
+				}
+				//Cell Voltages
+				for (uint8_t cell=0; cell<TLE9012_NUMBER_OF_CELLS; cell++)
+				{
+					tle9012Info.registers[i].CVM_Reg[cell].U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_CVM_0+cell, readresult);
+					cellInfo.cellV[i][cell] = tle9012Info.registers[i].CVM_Reg[cell].B.RESULT *5000/ 65536;
+					cellInfo.soc[i][cell] = bmsControl_calculateSOC(cellInfo.cellV[i][cell]);
+				}
+			}
+			cellInfo.gettingMeasurement = 0;
+		}
+	}
+}
+
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_getFuelGaugeStatus()\n
+ *			This function retrieves the status of the fuel gauge
+ *
+ * @retval	None.
+ *****************************************************************************/
+static void bmsControl_getFuelGaugeStatus(void)
+{
+	switch (bmsControl.flowControl.fuelGauge_Control)
+	{
+		case FUEL_GAUGE_NONE:
+		{
+			break;
+		}
+		case FUEL_GAUGE_PSOC:
+		{
+			//TODO:Here we would get status from PSOC
+			break;
+		}
+		default:
+		{
+			break;
+		}
+	}
+
+}
+
+
+/**
+ ******************************************************************************
+ *
+ * @author 	AP
+ * @date   	June2024
+ * @brief	Function: bmsControl_gpioledCharge()
+ *			This function operates the GPIO as a PWM pin
+ *
+ * @retval	None.
+ *****************************************************************************/
+static void bmsControl_gpioledCharge(void)
+{
+	TLE9012_GPIO_Register_t	configGPIO;
+	uint32_t pwmCycle = 31;
+	uint8_t errormsg;
+
+//Charging Condition
+
+	while(packInfo.packCurrent > ICHARGE_MIN)
+	{
+		for(int i = 0; i < pwmCycle; i++)
+		configGPIO.B.OUT_GPIO0 = 1;
+		tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO,configGPIO.U16,&errormsg);
+
+		for(int i = 0; i < pwmCycle; i++)
+		configGPIO.B.OUT_GPIO0 = 0;
+		tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO,configGPIO.U16,&errormsg);
+	}
+
+//Charging Condition
+
+	while (packInfo.packCurrent < IDISCHARGE_MIN)
+	{
+		configGPIO.B.OUT_GPIO1 = 1;
+		delayMillseconds(pwmCycle);
+		configGPIO.B.OUT_GPIO1 = 0;
+		delayMillseconds(pwmCycle);
+
+		tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO,configGPIO.U16,&errormsg);
+	}
+
+	configGPIO.B.OUT_GPIO0 = 0;
+	configGPIO.B.OUT_GPIO1 = 0;
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO,configGPIO.U16,&errormsg);
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_getCellMonitoringStatus()\n
+ *			This function retrieves the TLE9012 registers and places them into TLE9012_NETWORK_INFO_s
+ *
+ * @retval	None.
+ *****************************************************************************/
+static void bmsControl_getCellMonitoringStatus(void)
+{
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		uint8_t errormsg;
+		uint8_t balOC_cnt = 0;
+		uint8_t readresult[20];
+
+		if(tle9012Info.isInitialized && tle9012Info.isNumerated)
+		{
+			//cycle through all the nodes
+			for (uint8_t i=0; i< TLE9012_NUMBER_NODES; i++)
+			{
+				tle9012Info.registers[i].CONFIG_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_CONFIG, readresult);
+				tle9012Info.registers[i].PART_CONFIG_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_PART_CONFIG, readresult);
+				tle9012Info.registers[i].OL_OV_THR_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_OL_OV_THR, readresult);
+				tle9012Info.registers[i].OL_UV_THR_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_OL_UV_THR, readresult);
+				tle9012Info.registers[i].GEN_DIAG_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_GEN_DIAG, readresult);
+				tle9012Info.registers[i].TEMP_CONF_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_TEMP_CONF, readresult);
+				tle9012Info.registers[i].RR_CONFIG_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_RR_CONFIG, readresult);
+
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.ADC_ERR == 1)
+				{
+					tle9012_WrReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_GEN_DIAG, tle9012Info.registers[i].GEN_DIAG_Reg.U16 & 0xFFBF, &errormsg);
+				}
+
+				//check for Open wire / load error
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.OL_ERR == 1)
+				{
+					tle9012Info.registers[i].DIAG_OL_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_DIAG_OL, readresult);
+				}
+
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.REG_CRC_ERR == 1)
+				{
+					tle9012Info.registers[i].REG_CRC_ERR_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_REG_CRC_ERR, readresult);
+				}
+
+				//check which ext temp fault occurred
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.EXT_T_ERR == 1)
+				{
+					tle9012Info.registers[i].EXT_TEMP_DIAG_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_EXT_TEMP_DIAG, readresult);
+				}
+
+				//check which cell under voltage occurred in
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.CELL_UV == 1)
+				{
+					tle9012Info.registers[i].CELL_UV_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_CELL_UV, readresult);
+				}
+
+				//check which cell over voltage occurred in
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.CELL_OV == 1)
+				{
+					tle9012Info.registers[i].CELL_OV_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_CELL_OV, readresult);
+				}
+
+				//check which cell balancing under current occurred in
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.BAL_ERR_UC == 1)
+				{
+					tle9012Info.registers[i].BAL_DIAG_UC_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_BAL_DIAG_UC, readresult);
+				}
+
+				//check which cell balancing over current occurred in
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.BAL_ERR_OC == 1)
+				{
+					tle9012Info.registers[i].BAL_DIAG_OC_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_BAL_DIAG_OC, readresult);
+					if (balOC_cnt++ <=5)
+					{
+						tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GEN_DIAG, tle9012Info.registers[i].GEN_DIAG_Reg.U16 & 0x7FFF, &errormsg);
+					}
+					else
+					{
+						balOC_cnt = 6;
+					}
+				}
+				if (tle9012Info.registers[i].GEN_DIAG_Reg.B.INT_OT == 1 && cellInfo.intTemp[i] < (TLE9012_INT_TEMP_THR-10))
+				{
+					TLE9012_GEN_DIAG_Register_t tmpGenReg;
+					tmpGenReg.U16 = tle9012Info.registers[i].GEN_DIAG_Reg.U16;
+					tmpGenReg.B.INT_OT = 0;
+					tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GEN_DIAG, tmpGenReg.U16, &errormsg);
+				}
+			}
+		}
+	}
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_chargeDischarge_Control()\n
+ *			This function controls the contactors for discharging ripple charging
+ *			and charging.  It will also call SOC correction if required
+ *
+ * @retval	None.
+ *****************************************************************************/
+static void bmsControl_chargeDischarge_Control(void)
+{
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		if (bmsControl.control)
+		{
+			if (bmsControl.dischargeControl == TRUE && bmsControl.discharge_relay == FALSE)
+			{
+				//Turn off charge relay and turn on load relay
+				CHARGE_DISABLE;
+				ecu8Info.contactorState.B.chargeContactor = GET_CHARGE_PINSTATE;
+				bmsControl.charge_relay = 0;
+				bmsControl.rippleCharge = 0;
+
+				DISCHARGE_ENABLE;
+				ecu8Info.contactorState.B.dischargeContactor = GET_DISCHARGE_PINSTATE;
+				bmsControl.discharge_relay = 1;
+			}
+			else if ((packInfo.packVoltage <= VBAT_MIN && bmsControl.charge_relay == 0) || (bmsControl.chargeControl == TRUE))
+			{
+				// turn load relay off
+				DISCHARGE_DISABLE;
+				ecu8Info.contactorState.B.dischargeContactor = GET_DISCHARGE_PINSTATE;
+				bmsControl.discharge_relay = 0;
+				bmsControl.dischargeControl = 0;
+
+				if (!bmsControl.charge_relay && !bmsControl.precharge_relay)
+				{
+					//turn on pre-charge relay
+					PRECHARGE_ENABLE;
+					bmsControl.precharge_relay = 1;
+					bmsControl.timerPrecharge = 0;
+				}
+				else if (!bmsControl.charge_relay && bmsControl.precharge_relay && bmsControl.timerPrecharge >= PRECHARGE_DELAY)
+				{
+					PRECHARGE_DISABLE;
+					//Turn charge relay on
+					CHARGE_ENABLE;
+					ecu8Info.contactorState.B.chargeContactor = GET_CHARGE_PINSTATE;
+					bmsControl.charge_relay = 1;
+					bmsControl.precharge_relay = 0;
+					bmsControl.chargeControl = 0;
+				}
+			}
+			else if (packInfo.packVoltage >= (VFLOAT -1000)  && bmsControl.rippleCharge == FALSE && (packInfo.packCurrent>0 && packInfo.packCurrent <= ICHARGE_MIN))
+			{
+				//Turn Charge relay off and allow to self discharge
+				CHARGE_DISABLE;
+				ecu8Info.contactorState.B.chargeContactor = GET_CHARGE_PINSTATE;
+				bmsControl.charge_relay = 0;
+
+				//charging is finished.  Start ripple charging
+				bmsControl.rippleCharge = 1;
+
+			}
+			else if (packInfo.packVoltage <= VRIPPLECHARGE && bmsControl.rippleCharge == TRUE)
+			{
+				bmsControl.rippleCharge = 0;
+
+				//Turn Charge relay back on
+				CHARGE_ENABLE;
+				ecu8Info.contactorState.B.chargeContactor = GET_CHARGE_PINSTATE;
+				bmsControl.charge_relay = 1;
+			}
+		}
+	}
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Mar2022
+ * @brief	Function: bmsControl_CheckBalancing()\n
+ * 			This routine checks and enables cell balancing when it is required
+ *
+ *
+ * @retval	None.
+ *****************************************************************************/
+
+static void bmsControl_CheckBalancing(void)
+{
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		uint16_t lowestCellVoltage = 5000;
+		uint16_t highestCellVoltage = 0;
+		uint8_t errormsg;
+
+		if (!bmsControl.charging && !bmsControl.discharging && tle9012Info.balancingEnabled)
+		{
+			for (uint8_t i =0; i< TLE9012_NUMBER_NODES; i++)
+			{
+				//check to see if that node requires balancing
+				if ((cellInfo.highestCell[i] - cellInfo.lowestCell[i]) >= TLE9012_BALANCING_THRESHOLD || cellInfo.highestCell[i] >= TLE9012_CELL_FLOAT + TLE9012_BALANCING_THRESHOLD)
+				{
+					cellInfo.cellBalancingRequired[i] = 1;
+				}
+				else
+				{
+					cellInfo.cellBalancingRequired[i] = 0;
+				}
+
+				if (cellInfo.cellBalancingRequired[i] == 1)
+				{
+
+					//determine the of the lowest cell voltage by cycling through all 12 cells
+					lowestCellVoltage = 5000;
+					for (uint8_t cell = 0; cell < TLE9012_NUMBER_OF_CELLS; cell++)
+					{
+						if (cellInfo.cellV[i][cell] < lowestCellVoltage)
+						{
+							lowestCellVoltage = cellInfo.cellV[i][cell];
+						}
+						if (cellInfo.cellV[i][cell] > highestCellVoltage)
+						{
+							highestCellVoltage = cellInfo.cellV[i][cell];
+						}
+					}
+
+					//set the position that needs to be balances
+					cellInfo.cellBalancingPosition[i] = 0; // clear position
+					cellInfo.numCellsRequireBalancing[i]=0;
+					for (uint8_t cell = 0; cell < TLE9012_NUMBER_OF_CELLS; cell++)
+					{
+						if (cellInfo.cellV[i][cell] >= lowestCellVoltage + TLE9012_BALANCING_THRESHOLD)
+						{
+							cellInfo.numCellsRequireBalancing[i]++;
+							cellInfo.cellBalancingPosition[i] |= 1 << cell;
+						}
+					}
+					tle9012Info.registers[i].BAL_SETTINGS_Reg.U16 = cellInfo.cellBalancingPosition[i];
+
+
+					//set Balancing active on TLE9012
+					tle9012_WrReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_BAL_SETTINGS, tle9012Info.registers[i].BAL_SETTINGS_Reg.U16, &errormsg );
+				}
+			}//for (uint8_t i =0; i< TLE9012_NUMBER_NODES; i++)
+
+		}
+		else
+		{
+			for (uint8_t i =0; i< TLE9012_NUMBER_NODES; i++)
+			{
+				//clear cell balancing
+				cellInfo.cellBalancingRequired[i] = 0;
+				cellInfo.cellBalancingPosition[i] = 0;
+				tle9012Info.registers[i].BAL_SETTINGS_Reg.U16 = 0;
+				tle9012_WrReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_BAL_SETTINGS, tle9012Info.registers[i].BAL_SETTINGS_Reg.U16 , &errormsg );
+			}
+		}
+	}
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Mar2022
+ * @brief	Function: bmsControl_Protection()\n
+ * 			This routine checks to see if the tle9012 has encountered any faults
+ * 			which require the contactor to open immediately
+ *
+ * @retval	None.
+ *****************************************************************************/
+static void bmsControl_Protection(void)
+{
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		//cycle through all the nodes
+		for (uint8_t i=0; i<TLE9012_NUMBER_NODES; i++)
+		{
+			//check for cell over voltage and disconnect charger
+			if (tle9012Info.registers[i].GEN_DIAG_Reg.B.CELL_OV == 1)
+			{
+				CHARGE_DISABLE;
+				ecu8Info.contactorState.B.chargeContactor = GET_CHARGE_PINSTATE;
+				bmsControl.chargeControl = 0;
+				bmsControl.charge_relay = 0;
+				bmsControl.rippleCharge = 0;
+				bmsControl.control = 0;
+				bmsControl.protection = 4;
+			}
+			//check for cell under voltage and disconnect load
+			if (tle9012Info.registers[i].GEN_DIAG_Reg.B.CELL_UV == 1)
+			{
+				DISCHARGE_DISABLE;
+				ecu8Info.contactorState.B.dischargeContactor = GET_DISCHARGE_PINSTATE;
+				bmsControl.dischargeControl = 0;
+				bmsControl.discharge_relay = 0;
+				bmsControl.control = 0;
+				bmsControl.protection = 2;
+			}
+
+			//Check for pack over voltage and disconnect charger  (Just in case charger loses control)
+			if(cellInfo.batV[i] >= TLE9012_PACK_OVERVOLTAGE)
+			{
+				CHARGE_DISABLE;
+				ecu8Info.contactorState.B.chargeContactor = GET_CHARGE_PINSTATE;
+				bmsControl.chargeControl = 0;
+				bmsControl.charge_relay = 0;
+				bmsControl.rippleCharge = 0;
+				bmsControl.control = 0;
+				bmsControl.protection = 3;
+			}
+		}
+	}
+}
+
+
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_ConfigTLE9012()\n
+ * 			This routine \n
+ * 			1.) Initializes the configuration registers\n
+ * 			2.) Calculates the thresholds\n
+ * 			3.) Configures the threshold registers
+ *
+ * @retval	None.
+ *****************************************************************************/
+static void bmsControl_ConfigTLE9012(void)
+{
+	TLE9012_Register_t configRegisters;
+	uint8_t errormsg;
+	//uint8_t readresult[10];
+
+	//1. Initialize configuration registers.
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_PART_CONFIG, TLE9012_PART_CONF_DEFAULT, &errormsg );
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_OP_MODE, TLE9012_OP_MODE_DEFAULT, &errormsg );
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GEN_DIAG, 0x0000, &errormsg);
+
+	//2. Calculate all the thresholds
+	configRegisters.OL_OV_THR_Reg.B.OL_THR_MAX = TLE9012_OL_THR_MAX;;
+
+	//OV THR
+	configRegisters.OL_OV_THR_Reg.B.OV_THR = TLE9012_CELL_MAX*TLE9012_OVUV_LSB / 10000;
+
+	//Configure OL_UV_THR
+	//OL_MIN
+	configRegisters.OL_UV_THR_Reg.B.OL_THR_MIN = TLE9012_OL_THR_MIN;
+
+	//UV THR
+	configRegisters.OL_UV_THR_Reg.B.UV_THR = TLE9012_CELL_MIN*TLE9012_OVUV_LSB/10000;
+
+	//Configure EXT Thermistor Thresholds and register values
+	configRegisters.TEMP_CONF_Reg.B.I_NTC = TLE9012_I_NTC;
+	configRegisters.TEMP_CONF_Reg.B.EXT_OT_THR = TLE9012_EXT_OT_THR;
+	configRegisters.TEMP_CONF_Reg.B.NR_TEMP_SENSE = TLE9012_NUMBER_EXT_THERM;
+
+	//config Internal temp threshold
+	configRegisters.INT_OT_WARN_CONF_Reg.B.INT_OT_THR = ((5473-TLE9012_INT_TEMP_THR)* TLE9012_T_INT_LSB)/1000;
+
+	//configure balancing over/under current thresholds
+	//OC
+	configRegisters.BAL_CURR_THR_Reg.B.OC_THR = TLE9012_BAL_OC_THR;
+	//UC
+	configRegisters.BAL_CURR_THR_Reg.B.UC_THR = TLE9012_BAL_UC_THR;
+
+	configRegisters.RR_CONFIG_Reg.B.M_NR_ERR_OL_ERR = 0;
+	configRegisters.RR_CONFIG_Reg.B.RR_SYNC = 0;
+	configRegisters.RR_CONFIG_Reg.B.RR_CNT = 0x7F;
+
+	configRegisters.GPIO_Reg.B.DIR_GPIO0 = 0;
+	configRegisters.GPIO_Reg.B.DIR_GPIO1 = 0;
+	configRegisters.GPIO_Reg.B.DIR_PWM0 = 1;
+	configRegisters.GPIO_Reg.B.DIR_PWM1 = 1;
+	configRegisters.GPIO_Reg.B.OUT_GPIO0 = 0;
+	configRegisters.GPIO_Reg.B.OUT_GPIO1 = 0;
+	configRegisters.GPIO_Reg.B.PWM_PWM0 = 0;
+	configRegisters.GPIO_Reg.B.PWM_PWM1 = 0;
+	configRegisters.GPIO_Reg.B.OUT_PWM0 = 0;
+	configRegisters.GPIO_Reg.B.OUT_PWM1 = 0;
+	configRegisters.GPIO_PWM_Reg.B.PWM_DUTY_CYCLE = 0x1F;
+	configRegisters.GPIO_PWM_Reg.B.PWM_PERIOD = 0x1F;
+
+
+
+		for (uint8_t i=0;i< tle9012Info.numNodesDetected;i++)
+	{
+		tle9012Info.registers[i].GPIO_Reg.U16 = configRegisters.GPIO_Reg.U16;
+	}
+
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO,configRegisters.GPIO_Reg.U16,&errormsg);
+
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_GPIO_PWM,configRegisters.GPIO_PWM_Reg.U16,&errormsg);
+
+
+	//3. Configure Threshold registers
+	//Over voltage
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_OL_OV_THR, configRegisters.OL_OV_THR_Reg.U16, &errormsg );
+	//Under voltage
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_OL_UV_THR, configRegisters.OL_UV_THR_Reg.U16, &errormsg );
+	//Internal over temperature
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_INT_OT_WARN_CONF, configRegisters.INT_OT_WARN_CONF_Reg.U16, &errormsg );
+	//External over temperature
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_TEMP_CONF, configRegisters.TEMP_CONF_Reg.U16, &errormsg );
+	//Balancing current threshold
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_BAL_CURR_THR, configRegisters.BAL_CURR_THR_Reg.U16, &errormsg );
+
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_RR_CONFIG, configRegisters.RR_CONFIG_Reg.U16, &errormsg );
+
+
+	//Fault mask
+	tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_FAULT_MASK, TLE9012_FAULT_MASK_DEFAULT, &errormsg );
+}
+
+/**\}*/
+/**
+ * ******************************
+ * \name Public Functions
+ *******************************
+ *
+ *\{*/
+
+
+void bmsControl_clearMetrics(void)
+{
+	for (uint8_t i=0;i< TLE9012_NUMBER_NODES;i++)
+	{
+		cellInfo.batV[i] = 0;
+		cellInfo.cellBalancingPosition[i] = 0;
+		cellInfo.cellBalancingRequired[i] = 0;
+		for (uint8_t cell = 0; cell <TLE9012_NUMBER_OF_CELLS; cell++)
+		{
+			cellInfo.cellV[i][cell] = 0;
+			cellInfo.soc[i][cell] = 0;
+		}
+		for (uint8_t therm = 0; therm < TLE9012_NUMBER_EXT_THERM; therm++)
+		{
+			cellInfo.extTemp[i][therm] = 0;
+		}
+		cellInfo.intTemp[i] = 0;
+		cellInfo.highestCell[i] = 0;
+		cellInfo.lowestCell[i] = 0;
+		cellInfo.numCellsRequireBalancing[i] = 0;
+	}
+}
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_keepAliveTLE9012()\n
+ * 			updates tle9012 WDOG_CNT if enable WDOG is set and the device is numerated
+ *
+
+ * @retval	None.
+ *****************************************************************************/
+void bmsControl_keepAliveTLE9012(void)
+{
+	if (tle9012Info.wdgEnable == true && tle9012Info.isNumerated == true)
+	{
+		uint8_t retVal;
+
+		tle9012_WrReg( tle9012Info.ntwkConfig, 0x3F, TLE9012_REG_WDOG_CNT, 0x3f, &retVal );
+	}
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_Timer1Sec()\n
+ * 			This routine is called every second from core0_main thread
+ * 			All functions that need to occur every sec will be placed here
+ *
+ * @retval	None.
+ *****************************************************************************/
+void bmsControl_Timer1Sec(void)
+{
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		if (true == tle9012Info.startCommand )
+		{
+			tle9012Info.TimerStartup++;
+		}
+		else
+		{
+			tle9012Info.TimerStartup = 0;
+		}
+
+		if (tle9012Info.TimerStartup == TLE9012_ENUMERATE_DELAY  )
+		{
+			if (FALSE == tle9012Info.isInitialized)
+			{
+				tle9012Info.isInitialized = bmsControl_TLE9012_Initialization();
+				if (false == tle9012Info.isInitialized)
+				{
+					tle9012Info.TimerStartup = 0;
+				}
+			}
+		}
+		else if (tle9012Info.TimerStartup >= STARTUP_DELAY)
+		{
+			tle9012Info.TimerStartup = STARTUP_DELAY;
+
+			if (false == bmsControl.flagConfig9012)
+			{
+				bmsControl_ConfigTLE9012();
+				 bmsControl.flagConfig9012 = true;
+			}
+		}
+
+		//apply VCC to the Fuel Gauge Board via VOUT_L_0
+		if ((tle9012Info.TimerStartup >= FUEL_GAUGE_START_DELAY) && (tle9012Info.isInitialized == true)&&(0 != bmsControl.flowControl.fuelGauge_Control))
+		{
+//			FUEL_GAUGE_ENABLE; TODO: remove me once fixed
+		}
+
+		if (tle9012Info.isInitialized)
+		{
+			if (TRUE == ecu8Info.flag.cyclingStarted)
+			{
+				ecu8Control_cyclingControl();
+			}
+			else
+			{
+				bmsControl_chargeDischarge_Control();
+			}
+
+			bmsControl_CheckBalancing();
+			bmsControl_Protection();
+
+			//start checking for faults
+			//if no faults for 50s then initate cycling
+			if (FALSE == ecu8Info.flag.cyclingStarted && TRUE == ecu8Info.flag.startCycling)
+			{
+				if (ECU8_CYCLING_START_TIME <= ecu8Info.counter.startCycling )
+				{
+					// lets start the cycling sequence
+					ecu8Info.flag.cyclingStarted = TRUE;
+				}
+				else if (bmsControl.protection != 0)
+				{
+					//fault has occurred, reset the timer
+					//make sure red led is on
+					ecu8Info.counter.startCycling = 0;
+				}
+				else
+				{
+					ecu8Info.counter.startCycling++;
+//					IDLE_LED_ON;
+				}
+			}
+		}
+	}
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_Timer10ms()\n
+ * 			This routine is called every 10 milliseconds from core0_main thread
+ * 			All functions that need to occur every 10ms will be placed here
+ *
+ * @retval	None.
+ *****************************************************************************/
+void bmsControl_Timer10ms(void)
+{
+
+	bmsControl_getFuelGaugeStatus();
+
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		if (!cellInfo.gettingMeasurement && tle9012Info.isInitialized)
+		{
+			bmsControl_getCellMonitoringStatus();
+		}
+	}
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_Timer100ms()\n
+ * 			This routine is called every 100 milliseconds from core0_main thread
+ * 			All functions that need to occur every 100ms will be placed here
+ *
+
+ * @retval	None.
+ *****************************************************************************/
+void bmsControl_Timer100ms(void)
+{
+	__private0 __far static uint8_t readTimer = 0;
+
+	if (TRUE == bmsControl.flowControl.tle9012_Control)
+	{
+		if (tle9012Info.isInitialized) // 100ms timer
+		{
+			bmsControl_keepAliveTLE9012();
+
+			if (readTimer == 7)
+			{
+				bmsControl_getCellMetrics();
+			}
+		}
+	}
+
+	if (readTimer++ >= 10)
+	{
+		readTimer = 0;
+	}
+
+	if (bmsControl.timerPrecharge++ >10)
+	{
+		bmsControl.timerPrecharge = 10;
+	}
+
+	bmsControl_getBatteryMetrics();
+
+}
+
+/**
+ ******************************************************************************
+ *
+ * @author 	RL
+ * @date   	Jan2021
+ * @brief	Function: bmsControl_Initialize()\n
+ * 			This routine is initializes the contactors and drive for the Fuel Gauge
+ *
+ * @retval	None.
+ *****************************************************************************/
+void bmsControl_Initialize(void)
+{
+	VOUT_H_DSEL_DISABLE;
+	VOUT_H_DEN_DISABLE;
+//	FUEL_GAUGE_DISABLE;
+	VOUT_L_0_ENABLE;
+//	VOUT_L_1_ENABLE; TODO: remove me
+
+	bmsControl.control = 0;
+	bmsControl.charge_relay = 0;
+	bmsControl.discharge_relay = 0;
+	bmsControl.protection = 0;
+	bmsControl.flowControl.tle9012_Control = FALSE;
+
+}
+/**\}*/
+
+
+static uint32_t bmsControl_calculateSOC(uint16_t voltage)
+{
+	uint32_t tempSOC = ((voltage - 2700)*1e6)/(TLE9012_CELL_FLOAT-2700);
+	if (tempSOC > 1000000)
+	{
+		tempSOC = 1000000;
+	}
+	return tempSOC;
+}
