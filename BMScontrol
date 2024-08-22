@@ -1,7 +1,3 @@
-/**
-Due to signed NDA's I cannot upload rest of the files, but here is an overview of the code to control the BMS
- */
-
 #include "bmsControl.h"
 #include <stdint.h>
 #include "shellprintf.h"
@@ -281,7 +277,7 @@ static void bmsControl_getFuelGaugeStatus(void)
 /**
  ******************************************************************************
  *
- * @author 	AP
+ * @author 	Adesh
  * @date   	June2024
  * @brief	Function: bmsControl_gpioledCharge()
  *			This function operates the GPIO as a PWM pin
@@ -503,7 +499,7 @@ static void bmsControl_chargeDischarge_Control(void)
  ******************************************************************************
  *
  * @author 	Adesh
- * @date   	Mar2022
+ * @date   	May2024
  * @brief	Function: bmsControl_CheckBalancing()\n
  * 			This routine checks and enables cell balancing when it is required
  *
