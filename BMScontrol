@@ -184,17 +184,17 @@ static void bmsControl_getCellMetrics(void)
 		{
 			cellInfo.gettingMeasurement = 1;
 			//trigger measurement
-			tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_MEAS_CTAdesh, TLE9012_TRIG_MEAS, &errormsg );
+			tle9012_WrReg(TLE9012_NTWK_CONFIG, TLE9012_BROADCAST_DEVICE, TLE9012_REG_MEAS_CTRL, TLE9012_TRIG_MEAS, &errormsg );
 
 			xTaskDelay(50);
 
 			for (uint8_t i=0;i< tle9012Info.numNodesDetected;i++)
 			{
-				tle9012Info.registers[i].MEAS_CTAdesh_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_MEAS_CTAdesh, readresult);
-				while ((tle9012Info.registers[i].MEAS_CTAdesh_Reg.U16 & 0x8840) != 0x0000 ) // Is a measurement in process
+				tle9012Info.registers[i].MEAS_CTRL_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_MEAS_CTRL, readresult);
+				while ((tle9012Info.registers[i].MEAS_CTRL_Reg.U16 & 0x8840) != 0x0000 ) // Is a measurement in process
 				{
 					delayMillseconds(1);
-					tle9012Info.registers[i].MEAS_CTAdesh_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_MEAS_CTAdesh, readresult);
+					tle9012Info.registers[i].MEAS_CTRL_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, 0x01, TLE9012_REG_MEAS_CTRL, readresult);
 				}
 				//Pack Voltage
 				tle9012Info.registers[i].BVM_Reg.U16 = tle9012_ReadReg(TLE9012_NTWK_CONFIG, i+1, TLE9012_REG_BVM, readresult);
@@ -245,8 +245,8 @@ static void bmsControl_getCellMetrics(void)
 /**
  ******************************************************************************
  *
- * @author 	Adesh
- * @date   	June2024
+ * @author 	RL
+ * @date   	June2023
  * @brief	Function: bmsControl_getFuelGaugeStatus()\n
  *			This function retrieves the status of the fuel gauge
  *
@@ -323,8 +323,8 @@ static void bmsControl_gpioledCharge(void)
 /**
  ******************************************************************************
  *
- * @author 	Adesh
- * @date   	June2024
+ * @author 	RL
+ * @date   	June2023
  * @brief	Function: bmsControl_getCellMonitoringStatus()\n
  *			This function retrieves the TLE9012 registers and places them into TLE9012_NETWORK_INFO_s
  *
@@ -498,8 +498,8 @@ static void bmsControl_chargeDischarge_Control(void)
 /**
  ******************************************************************************
  *
- * @author 	Adesh
- * @date   	May2024
+ * @author 	RL
+ * @date   	May2023
  * @brief	Function: bmsControl_CheckBalancing()\n
  * 			This routine checks and enables cell balancing when it is required
  *
@@ -583,8 +583,8 @@ static void bmsControl_CheckBalancing(void)
 /**
  ******************************************************************************
  *
- * @author 	Adesh
- * @date   	May2024
+ * @author 	RL
+ * @date   	March2023
  * @brief	Function: bmsControl_Protection()\n
  * 			This routine checks to see if the tle9012 has encountered any faults
  * 			which require the contactor to open immediately
@@ -770,8 +770,8 @@ void bmsControl_clearMetrics(void)
 /**
  ******************************************************************************
  *
- * @author 	Adesh
- * @date   	July2024
+ * @author 	RL
+ * @date   	September2023
  * @brief	Function: bmsControl_keepAliveTLE9012()\n
  * 			updates tle9012 WDOG_CNT if enable WDOG is set and the device is numerated
  *
@@ -791,8 +791,8 @@ void bmsControl_keepAliveTLE9012(void)
 /**
  ******************************************************************************
  *
- * @author 	Adesh
- * @date   	June2024
+ * @author 	RL
+ * @date   	June2023
  * @brief	Function: bmsControl_Timer1Sec()\n
  * 			This routine is called every second from core0_main thread
  * 			All functions that need to occur every sec will be placed here
@@ -882,8 +882,8 @@ void bmsControl_Timer1Sec(void)
 /**
  ******************************************************************************
  *
- * @author 	Adesh
- * @date   	June2024
+ * @author 	RL
+ * @date   	November2023
  * @brief	Function: bmsControl_Timer10ms()\n
  * 			This routine is called every 10 milliseconds from core0_main thread
  * 			All functions that need to occur every 10ms will be placed here
@@ -907,8 +907,8 @@ void bmsControl_Timer10ms(void)
 /**
  ******************************************************************************
  *
- * @author 	Adesh
- * @date   	August2024
+ * @author 	RL
+ * @date   	August2023
  * @brief	Function: bmsControl_Timer100ms()\n
  * 			This routine is called every 100 milliseconds from core0_main thread
  * 			All functions that need to occur every 100ms will be placed here
