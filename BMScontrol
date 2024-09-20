@@ -28,7 +28,7 @@ __private0 BMS_CONTROL_t bmsControl;						/**< \brief Flags which control operat
 /**
  ******************************************************************************
  *
- * @author 	Adesh
+ * @author 	RL
  * @date   	June2024
  * @brief	Function: bmsControl_TLE9012_Initialization()\n
  * 			This function performs the following functions\n
